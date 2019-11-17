@@ -3,15 +3,13 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
-// newly added:
 #include <string.h>
 
 __device__ __managed__ u32 gtime = 0;
 
-__device__ __managed__ u32* Sort_indexer;
-__device__ __managed__ u32* Sort_timer;
-__device__ __managed__ u32* Sort_size;
-__device__ __managed__ u32* Sort_creation;
+__device__ __managed__ int* global_time;
+__device__ __managed__ int* global_size;
+__device__ __managed__ int* global_created;
 
 __device__ void fs_init(FileSystem *fs, uchar *volume, int SUPERBLOCK_SIZE,
 							int FCB_SIZE, int FCB_ENTRIES, int VOLUME_SIZE,
@@ -45,12 +43,14 @@ __device__ int byteToInt(uchar a, uchar b) {
 	return result;
 }
 
-__device__ int Sort_cmp_S(const void* a_, const void* b_) {														// the function prepared for qsort.
+// acting as a comparator
+
+__device__ int cmpSize(const void* a_, const void* b_) {		// the function prepared for qsort.
 	const int* a = (int*)a_;
 	const int* b = (int*)b_;
-	if (Sort_size[*a]==Sort_size[*b])
+	if (global_size[*a] == global_size[*b])
 	{
-		if (Sort_creation[*a]> Sort_creation[*b])
+		if (global_created[*a] > global_created[*b])
 		{
 			return 1;
 		}
@@ -58,7 +58,7 @@ __device__ int Sort_cmp_S(const void* a_, const void* b_) {														// the 
 			return -1;
 		}
 	}
-	else if(Sort_size[*a]>Sort_size[*b]){
+	else if (global_size[*a] > global_size[*b]) {
 		return -1;
 	}
 	else {
@@ -66,14 +66,14 @@ __device__ int Sort_cmp_S(const void* a_, const void* b_) {														// the 
 	}
 }
 
-__device__ int Sort_cmp_D(const void* a_, const void* b_) {														// the function prepared for qsort.
+__device__ int cmpDate(const void* a_, const void* b_) {
 	const int* a = (int*)a_;
 	const int* b = (int*)b_;
-	if (Sort_timer[*a] == Sort_timer[*b])
+	if (global_time[*a] == global_time[*b])
 	{
 		return 0;
 	}
-	else if (Sort_timer[*a] > Sort_timer[*b]) {
+	else if (global_time[*a] > global_time[*b]) {
 		return -1;
 	}
 	else {
@@ -81,9 +81,7 @@ __device__ int Sort_cmp_D(const void* a_, const void* b_) {														// the 
 	}
 }
 
-// implementation of qsort in cuda:
-
-__device__ void cuda_swap(void* p1, void* p2, int size) {
+__device__ void swap(void* p1, void* p2, int size) {
 	int i = 0;
 	for (i = 0; i < size; i++)
 	{
@@ -93,38 +91,39 @@ __device__ void cuda_swap(void* p1, void* p2, int size) {
 	}
 }
 
-__device__ void cuda_qsort(void* base, int count, int size, int(*cmp)(const void*, const void*)) {
+
+// REFERENCE:: C source code of Qsort
+__device__ void sorting(void* base, int count, int size, int(*cmp)(const void*, const void*)) {
 	int i = 0;
 	int j = 0;
-	for (i = 0; i <count-1; i++)
+	for (i = 0; i < count - 1; i++)
 	{
-		for (j=0; j < count-i-1; j++)
+		for (j = 0; j < count - i - 1; j++)
 		{
-			if (cmp((char*)base+j*size,(char*)base+(j+1)*size)>0)
+			if (cmp((char*)base + j * size, (char*)base + (j + 1)*size) > 0)
 			{
-				cuda_swap((char*)base + j * size, (char*)base + (j + 1)*size, size);
+				swap((char*)base + j * size, (char*)base + (j + 1)*size, size);
 			}
 		}
 	}
 }
 
-__device__ void Sorter(u32 op, u32 existing_file_number) {
-	//printf("		[Sorter accessed]\n");
+
+
+__device__ void getSortedArr(int op, int fileCounter, int* creationTime, 
+	int* size, int* time, uchar filenames[1024][20], int* allIdx) {
+	
 	if (op == LS_D)
 	{
 		//printf("			[Signal:op == LS_D]\n");
-		cuda_qsort(Sort_indexer, existing_file_number, sizeof(int), Sort_cmp_D);
+		sorting(allIdx, fileCounter, sizeof(int), cmpDate);
 	}
 	else if (op == LS_S) {
 		//printf("			[Signal:op == LS_S]\n");
-		cuda_qsort(Sort_indexer, existing_file_number, sizeof(int), Sort_cmp_S);
-	}
-	else {
-		//printf("[Operation Error]: Wrong usage!\n");
-		// need to modify: to raise error.
-		return;
+		sorting(allIdx, fileCounter, sizeof(int), cmpSize);
 	}
 }
+
 
 // smaller helper functions:
 __device__ u32 cuda_strlen(char* a) {
@@ -157,35 +156,18 @@ __device__ u32 cuda_strcmp(char* a, char* b) {
 	return 0;
 }
 
-__device__ void cuda_strncpy(char* dest, char* src, u32 n) {
-	for (u32 i = 0; i < n; i++)
-	{
-		dest[i] = src[i];
-	}
-}
-
-__device__ void cuda_strcpy(char* dest, char* src) {
-	u32 len = cuda_strlen(src);
-	for (u32 i = 0; i < len; i++)
-	{
-		dest[i] = src[i];
-	}
-	dest[len] = '\0';
-	//printf("			[strcpy]:%s\n",dest);
-}
 
 // functions for garbage collection
 // firstly, three helper functions:
-__device__ u32 blockindex2FCBindex(FileSystem *fs, u32 blockindex) {
+__device__ int blkIdxToFCBIdx(FileSystem *fs, u32 blockindex) {
 	/*u32 block_address = fs->FILE_BASE_ADDRESS + blockindex * fs->STORAGE_BLOCK_SIZE;*/
-	u32 FCB_index = 0xFFFFFFFF;
-	for (u32 i = 0; i < fs->FCB_ENTRIES; i++) {
-		u32 iteration_FCB_address = fs->SUPERBLOCK_SIZE + fs->FCB_SIZE*i;										// access the 1st byte in the ith entry in 1024 FCB entries.
-		uchar iteration_file_block_pointer_first_half = fs->volume[iteration_FCB_address + 28];
-		uchar iteration_file_block_pointer_second_half = fs->volume[iteration_FCB_address + 29];
+	int FCB_index = -1;
+	for (int i = 0; i < fs->FCB_ENTRIES; i++) {
+		int fcbAddr = fs->SUPERBLOCK_SIZE + fs->FCB_SIZE*i;			// access the 1st byte in the ith entry in 1024 FCB entries.
+		uchar iteration_file_block_pointer_first_half = fs->volume[fcbAddr + 28];
+		uchar iteration_file_block_pointer_second_half = fs->volume[fcbAddr + 29];
 		u32 iteration_file_block_index = byteToInt(iteration_file_block_pointer_first_half, iteration_file_block_pointer_second_half);
-		if (blockindex == iteration_FCB_address)
-		{
+		if (blockindex == fcbAddr) {
 			FCB_index = i;
 			break;
 		}
@@ -205,7 +187,7 @@ __device__ int sizeInBlock(FileSystem* fs, int size) {
 	// file size in storage blks
 }
 
-__device__ u32 FCBindex2FileSize(FileSystem *fs, u32 FCBindex) {
+__device__ u32 FCBIdxToFileSize(FileSystem *fs, u32 FCBindex) {
 	u32 FCB_address = fs->SUPERBLOCK_SIZE + fs->FCB_SIZE*FCBindex;
 	uchar file_size_first_half = fs->volume[FCB_address + 26];
 	uchar  file_size_second_half = fs->volume[FCB_address + 27];
@@ -214,11 +196,9 @@ __device__ u32 FCBindex2FileSize(FileSystem *fs, u32 FCBindex) {
 }
 
 
-// main utility function:
-
-__device__ u32 SearchSpaceRoutine(FileSystem *fs, u32 size) {
+__device__ u32 findNextFree(FileSystem *fs, u32 size) {
 	// the 'size' here stands for the number of needed blocks!
-	//printf("		[SearchSpaceRoutine accessed]\n");
+	//printf("		[findNextFree accessed]\n");
 	u32 pos = -1;
 	// the result to return us actually the file block index.
 	u32 count = 0;
@@ -281,131 +261,125 @@ __device__ u32 SearchSpaceRoutine(FileSystem *fs, u32 size) {
 	return -1;
 }
 
-// where we always set the char_list as fs->volume.
-__device__ void SuperBlockModifier(FileSystem *fs, u32 first_file_block_index, u32 len, u32 op) {
-	// the 'len' here stands for the number of needed blocks!
-	//printf("		[SuperBlockModifier accessed]\n");
-	uchar* uchar_list = fs->volume;
-	if (first_file_block_index + len - 1 > 32767)																					// since the index of empty list is from 0 to 32k-1=32767.
+
+__device__ void changeSuperBlock(FileSystem *fs, u32 blkIdx, u32 len, u32 op) {
+	
+	/*
+	if op == 1, change the superblock to be 'in use' and vice versa
+	the 'len' here stands for the number of needed blocks
+	*/
+	
+	if (blkIdx + len - 1 > 32767)																					// since the index of empty list is from 0 to 32k-1=32767.
 	{
-		printf("Out of bounds!\n");
-		// need to modify: to raise error.
+		printf("The block index is out of bound\n");
 		return;
 	}
-	/*u32 first_byte_index = first_file_block_index / 8;
-	u32 first_byte_offset = first_file_block_index % 8;
-	u32 second_byte_index = (first_file_block_index+len) / 8;
-	u32 second_byte_offset = (first_file_block_index+len) % 8;*/
-	int first_byte_index = first_file_block_index / 8;
-	int first_byte_offset = first_file_block_index % 8;
-	int second_byte_index = (first_file_block_index + len) / 8;
-	int second_byte_offset = (first_file_block_index + len) % 8;
-	if (op == 0)
-	{
-		//printf("		Signal1\n");
+	int first_byte_index = blkIdx / 8;
+	int first_byte_offset = blkIdx % 8;
+	int second_byte_index = (blkIdx + len) / 8;
+	int second_byte_offset = (blkIdx + len) % 8;
+
+	if (op == 0) {
+		// free the blocks in use
 		if (first_byte_index == second_byte_index)
 		{
-			uchar tool = 0xFF;
-			for (u32 i = (7 - second_byte_offset + 1); i <= (7 - first_byte_offset); i++)
+			uchar tool = 255;
+			for (int i = (7 - second_byte_offset + 1); i <= (7 - first_byte_offset); i++)
 			{
 				tool = tool - (1 << i);
 			}
-			uchar_list[first_byte_index] = (uchar_list[first_byte_index] & tool);
+			fs->volume[first_byte_index] = (fs->volume[first_byte_index] & tool);
 		}
 		else {
-			uchar tool1 = 0xFF;
-			uchar tool2 = 0xFF;
-			for (u32 i = 0; i <= (7 - first_byte_offset); i++)
+			uchar tool1 = 255;
+			uchar tool2 = 255;
+			for (int i = 0; i <= (7 - first_byte_offset); i++)
 			{
 				tool1 = tool1 - (1 << i);
 			}
-			uchar_list[first_byte_index] = (uchar_list[first_byte_index] & tool1);
+			fs->volume[first_byte_index] = (fs->volume[first_byte_index] & tool1);
 
-			for (u32 byte_index = first_byte_index + 1; byte_index < second_byte_index; byte_index++)
+			for (int byte_index = first_byte_index + 1; byte_index < second_byte_index; byte_index++)
 			{
-				uchar_list[byte_index] = 0x00;
+				fs->volume[byte_index] = 0;
 			}
 
-			for (int i = 8 - 1; i > (7 - second_byte_offset); i--)
+			for (int i = 7; i > (7 - second_byte_offset); i--)
 			{
 				tool2 = tool2 - (1 << i);
 			}
-			uchar_list[second_byte_index] = (uchar_list[second_byte_index] & tool2);
+			fs->volume[second_byte_index] = (fs->volume[second_byte_index] & tool2);
 		}
 	}
 	else {
-		if (first_byte_index == second_byte_index)
-		{
-			uchar tool = 0x00;
-			for (u32 i = (7 - second_byte_offset + 1); i <= (7 - first_byte_offset); i++)
+		if (first_byte_index == second_byte_index) {
+			uchar tool = 0;
+			for (int i = (7 - second_byte_offset + 1); i <= (7 - first_byte_offset); i++)
 			{
 				tool = tool + (1 << i);
 			}
-			uchar_list[first_byte_index] = (uchar_list[first_byte_index] | tool);
+			fs->volume[first_byte_index] = (fs->volume[first_byte_index] | tool);
 		}
 		else {
-			uchar tool1 = 0x00;
-			uchar tool2 = 0x00;
-			for (u32 i = 0; i <= (7 - first_byte_offset); i++)
+			uchar tool1 = 0;
+			uchar tool2 = 0;
+			for (int i = 0; i <= (7 - first_byte_offset); i++)
 			{
 				tool1 = tool1 + (1 << i);
 			}
-			uchar_list[first_byte_index] = (uchar_list[first_byte_index] | tool1);
+			fs->volume[first_byte_index] = (fs->volume[first_byte_index] | tool1);
 
-			for (u32 byte_index = first_byte_index + 1; byte_index < second_byte_index; byte_index++)
+			for (int byte_index = first_byte_index + 1; byte_index < second_byte_index; byte_index++)
 			{
-				uchar_list[byte_index] = 0xFF;
+				fs->volume[byte_index] = 255;
 			}
 
-			for (int i = 8 - 1; i > (7 - second_byte_offset); i--)
+			for (int i = 7; i > (7 - second_byte_offset); i--)
 			{
 				tool2 = tool2 + (1 << i);
 			}
-			uchar_list[second_byte_index] = (uchar_list[second_byte_index] | tool2);
+			fs->volume[second_byte_index] = (fs->volume[second_byte_index] | tool2);
 		}
 	}
 }
 
 
-__device__ void moveRoutine(FileSystem *fs, u32 last_0_index, u32 next_1_index, u32 size) {
+__device__ void moveBlocks(FileSystem *fs, u32 last_0, u32 next_1, u32 size) {
 	for (u32 index = 0; index < size; index++)
 	{
-		u32 iteration_last_0_address = fs->FILE_BASE_ADDRESS + (last_0_index + index) * fs->STORAGE_BLOCK_SIZE;
-		u32 iteration_next_1_address = fs->FILE_BASE_ADDRESS + (next_1_index + index) * fs->STORAGE_BLOCK_SIZE;
-		for (u32 offset = 0; offset < fs->STORAGE_BLOCK_SIZE; offset++)
+		int last_0_address = fs->FILE_BASE_ADDRESS + (last_0 + index) * fs->STORAGE_BLOCK_SIZE;
+		int next_1_address = fs->FILE_BASE_ADDRESS + (next_1 + index) * fs->STORAGE_BLOCK_SIZE;
+		for (int offset = 0; offset < fs->STORAGE_BLOCK_SIZE; offset++)
 		{
-			fs->volume[iteration_last_0_address + offset] = fs->volume[iteration_next_1_address + offset];
+			fs->volume[last_0_address + offset] = fs->volume[next_1_address + offset];
 		}
 	}
 	return;
 }
 
 __device__ void ResizeRoutine(FileSystem *fs) {
-	u32 last_0_index = 0;
-	u32 next_1_index = 0;
-	u32 find_0_first_time_flag = 1;
-	//
-	uchar* uchar_list = fs->volume;
+	int last_0_index = 0;
+	int next_1_index = 0;
+	int find_0_first_time_flag = 1;
+	
 	//
 	for (int index = 0; index < fs->SUPERBLOCK_SIZE; index++)
 	{
 		uchar tmpList[8];
-		u32 tmp = uchar_list[index];
-		for (int i = 8 - 1; i >= 0; i--)
+		int tmp = fs->volume[index];
+		for (int i = 7; i >= 0; i--)
 		{
-			u32 d = tmp % 2;
+			int d = tmp % 2;
 			if (d == 0)
 			{
 				tmpList[i] = '0';
-				//printf("		tmp[%d]= %c\n", i, tmpList[i]);
 			}
 			else {
 				tmpList[i] = '1';
-				//printf("		tmp[%d]= %c\n", i, tmpList[i]);
 			}
 			tmp = tmp / 2;
 		}
-		for (u32 offset = 0; offset < 8; offset++)
+		for (int offset = 0; offset < 8; offset++)
 		{
 			if (find_0_first_time_flag == 1 && tmpList[offset] == '1')
 			{
@@ -419,16 +393,16 @@ __device__ void ResizeRoutine(FileSystem *fs) {
 			}
 			if (find_0_first_time_flag == 0 && tmpList[offset] == '1')
 			{
-				u32 FCB_index_of_file_to_move = blockindex2FCBindex(fs, next_1_index);
-				u32 FCB_address_of_file_to_move = fs->SUPERBLOCK_SIZE + fs->FCB_SIZE*FCB_index_of_file_to_move;
-				u32 size_of_file_to_move = FCBindex2FileSize(fs, FCB_index_of_file_to_move);
+				int FCB_index_of_file_to_move = blkIdxToFCBIdx(fs, next_1_index);
+				int FCB_address_of_file_to_move = fs->SUPERBLOCK_SIZE + fs->FCB_SIZE*FCB_index_of_file_to_move;
+				int size_of_file_to_move = FCBIdxToFileSize(fs, FCB_index_of_file_to_move);
 				// refresh FCB pointer to last_0_index;
 				fs->volume[FCB_address_of_file_to_move + 28] = uchar(last_0_index >> 8);
 				fs->volume[FCB_address_of_file_to_move + 29] = uchar(last_0_index & 0x000000FF);
 				//
-				moveRoutine(fs, last_0_index, next_1_index, size_of_file_to_move);
-				SuperBlockModifier(fs, last_0_index, size_of_file_to_move, 1);
-				SuperBlockModifier(fs, next_1_index, size_of_file_to_move, 0);
+				moveBlocks(fs, last_0_index, next_1_index, size_of_file_to_move);
+				changeSuperBlock(fs, last_0_index, size_of_file_to_move, 1);
+				changeSuperBlock(fs, next_1_index, size_of_file_to_move, 0);
 				next_1_index++;
 			}
 			if (find_0_first_time_flag == 0 && tmpList[offset] == '0')
@@ -463,7 +437,6 @@ __device__ u32 fs_open(FileSystem *fs, char *s, int op)
 			}
 		}
 		if (filenameFlag == -1) {
-			//printf("found file name\n");
 			fcbIdx = i;
 			foundFlag = 1;
 			break;
@@ -539,7 +512,6 @@ __device__ void fs_read(FileSystem *fs, uchar *output, u32 size, u32 fp)
 __device__ u32 fs_write(FileSystem *fs, uchar* input, u32 size, u32 fp)
 {
 	/* Implement write operation here */
-	//printf("	[fs_write accessed]\n");
 	if (size > 1024) {
 		printf("File Size Larger Than 1024 Bytes!\n");
 		return -1;
@@ -551,7 +523,6 @@ __device__ u32 fs_write(FileSystem *fs, uchar* input, u32 size, u32 fp)
 	uchar blkIdxSecond = fs->volume[FCB_Addr + 29];
 
 	int originalBlkIdx = byteToInt(blkIdxFirst, blkIdxSecond);
-	// u32 originalBlkAddr = fs->SUPERBLOCK_SIZE + fs->FCB_ENTRIES*fs->FCB_SIZE + originalBlkIdx*fs->STORAGE_BLOCK_SIZE;
 	int originalBlkAddr = fs->FILE_BASE_ADDRESS + originalBlkIdx * fs->STORAGE_BLOCK_SIZE;
 	// check read/write mode:
 	if (fs->volume[FCB_Addr+24] != 1)
@@ -564,14 +535,12 @@ __device__ u32 fs_write(FileSystem *fs, uchar* input, u32 size, u32 fp)
 	{
 		isNewAllocation = 1;
 	}
-	//printf("	[Signal2]\n");
 	// if not newly allocated:
 	if (!isNewAllocation)
 	{
-		//printf("	[Signal3]\n");
 		// step1: check size:
 		int blocksNeeded = sizeInBlock(fs,size);
-		int oldSize = byteToInt(fs->volume[FCB_Addr + 26], fs->volume[FCB_Addr + 27]);											// 20+6;
+		int oldSize = byteToInt(fs->volume[FCB_Addr + 26], fs->volume[FCB_Addr + 27]);		// 20+6;
 		int oldBlkNumber = sizeInBlock(fs,oldSize);
 		int newBlkIdx = -1;
 		int newBlkAddr = -1;
@@ -579,21 +548,21 @@ __device__ u32 fs_write(FileSystem *fs, uchar* input, u32 size, u32 fp)
 		int blkChanged = 0;
 		if (size > oldSize) {
 			blkChanged = 1;
-			newBlkIdx = SearchSpaceRoutine(fs, blocksNeeded);
+			newBlkIdx = findNextFree(fs, blocksNeeded);
 		}
 		
 		// step2: if not enough, call file resizing routine:
 		if (newBlkIdx == -1)
 		{
+			// do collection of the fragments
 			ResizeRoutine(fs);
-			newBlkIdx = SearchSpaceRoutine(fs, blocksNeeded);
-			if (newBlkIdx == -1)															// which means no possible total empty space.
+			newBlkIdx = findNextFree(fs, blocksNeeded);
+			if (newBlkIdx == -1)						// which means no possible total empty space.
 			{
 				printf("No More Block Available in the FileSystem \n");
 				return -1;
 			}
 		}
-		//printf("		[Signal3.2]\n");
 		// step3:overwrite the file:
 		newBlkAddr = fs->FILE_BASE_ADDRESS + newBlkIdx * fs->STORAGE_BLOCK_SIZE;
 		for (int i = 0; i < size; i++)
@@ -601,12 +570,10 @@ __device__ u32 fs_write(FileSystem *fs, uchar* input, u32 size, u32 fp)
 			// store the content of the file into volume
 			fs->volume[newBlkAddr + i] = input[i];
 		}
-		//printf("		[Signal3.3]\n");
 		// step4: if file block changed, refresh the super block info (the empty list):
-		if (blkChanged)
-		{
-			SuperBlockModifier(fs, originalBlkIdx, oldBlkNumber, 0);
-			SuperBlockModifier(fs, newBlkIdx, blocksNeeded, 1);
+		if (blkChanged) {
+			changeSuperBlock(fs, originalBlkIdx, oldBlkNumber, 0);
+			changeSuperBlock(fs, newBlkIdx, blocksNeeded, 1);
 			// step5: refresh the FCB info2 ( pointer):
 			fs->volume[FCB_Addr + 28] = uchar(newBlkIdx >> 8);
 			fs->volume[FCB_Addr + 29] = uchar(newBlkIdx & 0x000000FF);
@@ -614,46 +581,40 @@ __device__ u32 fs_write(FileSystem *fs, uchar* input, u32 size, u32 fp)
 		// step5: refresh the FCB info1 ( new size):
 		fs->volume[FCB_Addr + 26] = uchar(size >> 8);
 		fs->volume[FCB_Addr + 27] = uchar(size & 0x000000FF);
-		//printf("		[Signal3.5]\n");
+
 		// step5: refresh the FCB info (access time, write time):
-		fs->volume[FCB_Addr + 20] = uchar(gtime>>8);														// then the access time must < 1<<17, need to modify;
+		fs->volume[FCB_Addr + 20] = uchar(gtime>>8);	// then the access time must < 1<<17, need to modify;
 		fs->volume[FCB_Addr + 21] = uchar(gtime & 0x000000FF);
 		gtime++;
-		//printf("		[Signal3.6]\n");
 	}
-	// if newly allocated:
 	else
 	{
-		//printf("	[Signal4]\n");
+		// if newly allocated:
 		int new_size_needed = size;
 		int blocksNeeded = sizeInBlock(fs,new_size_needed);
-		int newBlkIdx = 0xFFFFFFFF;
-		int newBlkAddr = 0xFFFFFFFF;
+		int newBlkIdx = -1;
+		int newBlkAddr = -1;
 		// step1: call file resizing routine:
-		newBlkIdx = SearchSpaceRoutine(fs, blocksNeeded);
-		//printf("		[Signal4.0]\n");
-		if (newBlkIdx == 0xFFFFFFFF)
+		newBlkIdx = findNextFree(fs, blocksNeeded);
+		if (newBlkIdx == -1)
 		{
 			//printf("		[Signal4.1]\n");
 			ResizeRoutine(fs);
-			newBlkIdx = SearchSpaceRoutine(fs, blocksNeeded);
-			if (newBlkIdx == 0xFFFFFFFF)															// which means no possible total empty space.
+			newBlkIdx = findNextFree(fs, blocksNeeded);
+			if (newBlkIdx == -1)	// which means no possible total empty space.
 			{
 				printf("No More Block Available, FileSystem is full\n");
 				return -1;
 			}
 		}
-		//printf("		[Signal4.2]\n");
 		// step2: overwrite the file:
 		newBlkAddr = fs->FILE_BASE_ADDRESS + newBlkIdx * fs->STORAGE_BLOCK_SIZE;
-		for (u32 i = 0; i < size; i++)
+		for (int i = 0; i < size; i++)
 		{
 			fs->volume[newBlkAddr + i] = input[i];
 		}
-		//printf("		[Signal4.3]\n");
 		// step3: refresh the FCB info (creation time, access time, write time, new size):
-		SuperBlockModifier(fs, newBlkIdx, blocksNeeded, 1);
-		//printf("		[Signal4.4]\n");
+		changeSuperBlock(fs, newBlkIdx, blocksNeeded, 1);
 		// step4: refresh the FCB info1 ( new size):
 		fs->volume[FCB_Addr + 26] = uchar(new_size_needed >> 8);
 		fs->volume[FCB_Addr + 27] = uchar(new_size_needed & 0x000000FF);
@@ -661,12 +622,11 @@ __device__ u32 fs_write(FileSystem *fs, uchar* input, u32 size, u32 fp)
 		fs->volume[FCB_Addr + 28] = uchar(newBlkIdx >> 8);
 		fs->volume[FCB_Addr + 29] = uchar(newBlkIdx & 0x000000FF);
 		// step5: refresh the FCB info (modified time, creation time):
-		fs->volume[FCB_Addr + 20] = uchar(gtime >> 8);														// then the access time must < 1<<17, need to modify;
+		fs->volume[FCB_Addr + 20] = uchar(gtime >> 8);
 		fs->volume[FCB_Addr + 21] = uchar(gtime & 0x000000FF);
-		fs->volume[FCB_Addr + 22] = uchar(gtime >> 8);														// then the access time must < 1<<17, need to modify;
+		fs->volume[FCB_Addr + 22] = uchar(gtime >> 8);
 		fs->volume[FCB_Addr + 23] = uchar(gtime & 0x000000FF);
 		gtime++;
-		//printf("		[Signal4.5]\n");
 	}
 	return 0;
 }
@@ -674,61 +634,55 @@ __device__ u32 fs_write(FileSystem *fs, uchar* input, u32 size, u32 fp)
 __device__ void fs_gsys(FileSystem *fs, int op)
 {
 	/* Implement LS_D and LS_S operation here */
-	//printf("	[fs_gsys accessed]\n");
-	uchar all_File_Names[1024][20];
-	u32 all_File_Modified_Time[1024];
-	u32 all_File_Size[1024];
-	u32 all_File_index[1024];
-	u32 all_File_Creation[1024];
-	u32 existing_file_number = 0;
-	// step1: firstly find the all existing files with existing_file_number as number, and store their names, dates and sizes.
-	// initialize the indexer first:
-	//printf("		[Signal1]\n");
-	for (u32  i = 0; i < 1024; i++)
-	{
-		all_File_index[i] = i;
+	uchar allFilenames[1024][20];
+	int modifiedTimes[1024];
+	int allSizes[1024];
+	int allIndex[1024];
+	int createdTime[1024];
+	int fileCounter = 0;
+	// step1: firstly find the all existing files with fileCounter as number, and store their names, dates and sizes.
+	// initialize the index first:
+	for (int i = 0; i < 1024; i++) {
+		allIndex[i] = i;
 	}
-	//printf("		[Signal2]\n");
-	for (u32 FCB_index = 0; FCB_index < fs->FCB_ENTRIES; FCB_index++)
-	{
-		u32 FCB_Addr = fs->SUPERBLOCK_SIZE + fs->FCB_SIZE*FCB_index;
+	for (int FCB_index = 0; FCB_index < fs->FCB_ENTRIES; FCB_index++) {
+		// iterating through all FCBs to find the used blocks
+		int FCB_Addr = fs->SUPERBLOCK_SIZE + fs->FCB_SIZE*FCB_index;
 		uchar blkIdxFirst = fs->volume[FCB_Addr + 28];
 		uchar blkIdxSecond = fs->volume[FCB_Addr + 29];
-		if (blkIdxFirst == 0xFF && blkIdxSecond == 0xFF) {
+		if (blkIdxFirst == 255 && blkIdxSecond == 255) {
+			// blk unused
 			continue;
 		}
-		//printf("		[Signal2]:%s\n", (char*)&(fs->volume[FCB_Addr]));
-		cuda_strncpy((char*)&all_File_Names[existing_file_number], (char*)&(fs->volume[FCB_Addr]), 20);
-		all_File_Modified_Time[existing_file_number] = byteToInt(fs->volume[FCB_Addr + 20], fs->volume[FCB_Addr + 21]);
-		all_File_Size[existing_file_number] = byteToInt(fs->volume[FCB_Addr + 26], fs->volume[FCB_Addr + 27]);
-		all_File_Creation[existing_file_number] = byteToInt(fs->volume[FCB_Addr + 22], fs->volume[FCB_Addr + 23]);
-		//printf("	Signal2:name:%s,time:%d\n", (char*)&all_File_Names[existing_file_number],all_File_Modified_Time[existing_file_number]);
-		existing_file_number = existing_file_number+1;
+		for (int i = 0; i < 20; i++) {
+			allFilenames[fileCounter][i] = fs->volume[FCB_Addr + i];
+		}
+
+		modifiedTimes[fileCounter] = byteToInt(fs->volume[FCB_Addr + 20], fs->volume[FCB_Addr + 21]);
+		allSizes[fileCounter] = byteToInt(fs->volume[FCB_Addr + 26], fs->volume[FCB_Addr + 27]);
+		createdTime[fileCounter] = byteToInt(fs->volume[FCB_Addr + 22], fs->volume[FCB_Addr + 23]);
+		
+		fileCounter++;
 	}
-	//printf("		[Signal3]:%d\n", existing_file_number);
-	Sort_indexer = all_File_index;
-	Sort_size = all_File_Size;
-	Sort_timer = all_File_Modified_Time;
-	Sort_creation = all_File_Creation;
-	//printf("		[Signal4]\n");
+	
+	global_size = allSizes;
+	global_time = modifiedTimes;
+	global_created = createdTime;
+
 	// step2: if sort and print by dates:
 	if (op == LS_D)
 	{
-		//printf("		[Signal5:op == LS_D]\n");
-		Sorter(LS_D, existing_file_number);
+		getSortedArr(LS_D, fileCounter,createdTime,allSizes,modifiedTimes,allFilenames,allIndex);
 	}// step3: if sort and print by sizes:
 	else if (op == LS_S)
 	{
-		//printf("		[Signal6:op == LS_S]\n");
-		Sorter(LS_S, existing_file_number);
+		getSortedArr(LS_S, fileCounter, createdTime, allSizes, modifiedTimes, allFilenames, allIndex);
 	}
 	// neither: must be wrong.
 	else {
-		//printf("[Operation Error]: Wrong usage!\n");
 		// need to modify: to raise error.
 	}
 	// step3: print out.
-	//printf("		[Signal7]\n");
 	if (op == LS_D)
 	{
 		printf("===sort by modified time===\n");
@@ -737,60 +691,66 @@ __device__ void fs_gsys(FileSystem *fs, int op)
 	{
 		printf("===sort by file size===\n");
 	}
-	//printf("		[Signal8: existing_file_number=%d]\n", existing_file_number);
-	for (u32 i = 0; i < existing_file_number; i++)
+	
+	for (int i = 0; i < fileCounter; i++)
 	{
-		u32 index_in_char_list = all_File_index[i];
+		int index_in_char_list = allIndex[i];
 		// the order changement of the indexer will not change the timer and sizer, whic means only indexer changed.
 		if (op == LS_D)
 		{
-			printf("%s\n",all_File_Names[index_in_char_list]);
+			printf("%s\n",allFilenames[index_in_char_list]);
 		}
 		else
 		{
-			printf("%s\t%d\n", all_File_Names[index_in_char_list],all_File_Size[index_in_char_list]);
+			printf("%s\t%d\n", allFilenames[index_in_char_list],allSizes[index_in_char_list]);
 		}
 	}
-	//printf("		[Signal9]\n");
+	
 }
 
 __device__ void fs_gsys(FileSystem *fs, int op, char *s)
 {
 	/* Implement rm operation here */
-	if (cuda_strlen(s) > 20)
-	{
-		printf("[Input Size Error]: File Name Size Exceed 20!\n");
-		return;
-	}
-	u32 find_name_flag = 0;
-	u32 found_FCB_index = 0xFFFFFFFF;
-	for (u32 i = 0; i < fs->FCB_ENTRIES; i++) {
-		u32 iteration_FCB_address = fs->SUPERBLOCK_SIZE + fs->FCB_SIZE*i;										// access the 1st byte in the ith entry in 1024 FCB entries.
-		// uchar* iteration_file_name = &(fs->volume[iteration_FCB_address]);										// since the file name is the first info, offset here is 0.
-		char iteration_file_name[21];
-		cuda_strncpy(iteration_file_name, (char*)&(fs->volume[iteration_FCB_address]), 20);							// after test, use (char*) to explictly trans uchar* to char*.
-		iteration_file_name[20] = '\0';
-		if (cuda_strcmp(s, (char*)iteration_file_name) == 0) {
-			found_FCB_index = i;
-			find_name_flag = 1;
-			break;
+	if (op == RM) {
+		if (cuda_strlen(s) > 20)
+		{
+			printf("File Name Size Exceed The Largest Filename Limit \n");
+			return;
 		}
+		int foundFile = 0;
+		int found_FCB_index = -1;
+		for (int i = 0; i < fs->FCB_ENTRIES; i++) {
+			int iteration_FCB_address = fs->SUPERBLOCK_SIZE + fs->FCB_SIZE*i;
+			// access the 1st byte in the ith entry in 1024 FCB entries.
+
+			char filename[21];
+			for (int i = 0; i < 20; i++) {
+				// setup filename
+				filename[i] = fs->volume[iteration_FCB_address + i];
+			}
+			filename[20] = '\0';
+
+			if (cuda_strcmp(s, (char*)filename) == 0) {
+				found_FCB_index = i;
+				foundFile = 1;
+				break;
+			}
+		}
+		if (foundFile != 1)
+		{
+			printf("Removing Unexisting File \n");
+			return;
+		}
+		int remove_FCB_address = fs->SUPERBLOCK_SIZE + fs->FCB_SIZE*found_FCB_index;
+		int remove_FCB_size = byteToInt(fs->volume[remove_FCB_address + 26], fs->volume[remove_FCB_address + 27]);
+		int remove_FCB_file_block_number = sizeInBlock(fs, remove_FCB_size);
+		// remove-step1: remove FCB.
+		for (int i = 0; i < fs->FCB_SIZE; i++)
+		{
+			fs->volume[remove_FCB_address + i] = 255;
+		}
+		// remove-step2: remove super-block.
+		changeSuperBlock(fs, found_FCB_index, remove_FCB_file_block_number, 0);
 	}
-	if (find_name_flag != 1)
-	{
-		printf("[User Operation Error]: Removing Unexisting File!\n");
-		return;
-		// need to modify: to raise error.
-	}
-	u32 remove_FCB_address = fs->SUPERBLOCK_SIZE + fs->FCB_SIZE*found_FCB_index;
-	u32 remove_FCB_size = byteToInt(fs->volume[remove_FCB_address + 26], fs->volume[remove_FCB_address + 27]);
-	u32 remove_FCB_file_block_number = sizeInBlock(fs,remove_FCB_size);
-	// remove-step1: remove FCB.
-	for (u32 i = 0; i < 32; i++)
-	{
-		fs->volume[remove_FCB_address + i] = 0xFF;
-	}
-	// remove-step2: remove super-block.
-	SuperBlockModifier(fs, found_FCB_index, remove_FCB_file_block_number, 0);
 
 }
